@@ -105,7 +105,7 @@ func (s *Store) writeEntry(entry []byte, key string, value []byte, timestamp uin
 		return fmt.Errorf("Store file is not initialized")
 	}
 
-	keyByte := string(key)
+	keyByte := []byte(key)
 
 	position, err := s.currentFile.Seek(0, io.SeekCurrent)
 	if err != nil {
@@ -160,9 +160,6 @@ func (*Store) Merge(directoryName string) error {
 func (*Store) Sync() error {
 	return nil
 }
-func (*Store) Close() error {
-	return nil
-}
 
 var (
 	ErrInvalidStoreOperation          = errors.New("Invalid store operation error")
@@ -213,6 +210,10 @@ func (s *store) Close() error {
 	if s.lockFile != nil {
 		Unlock(s.lockFile)
 		s.lockFile.Close()
+	}
+
+	if s.currentFile != nil {
+		s.currentFile.Close()
 	}
 
 	return nil

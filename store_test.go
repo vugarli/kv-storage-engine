@@ -6,9 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -386,17 +389,193 @@ func TestEntryParsing(t *testing.T) {
 
 func TestPut(t *testing.T) {
 
-	mf := MockFileSystem{}
-	key, value := "key", "value"
+	t.Run("Successful write", func(t *testing.T) {
+		mf := OSFileSystem{}
+		key, value := "key", "value"
+		directory := t.TempDir()
+		store, _ := Open(directory, mf, true)
 
-	store, _ := Open("/dir/store", mf, true)
+		timeStamp := uint64(time.Now().Unix())
 
-	timeStamp := uint64(time.Now().Unix())
+		entry := InitEntry([]byte(key), []byte(value), timeStamp)
 
-	entry := InitEntry([]byte(key), []byte(value), timeStamp)
+		if err := store.writeEntry(entry, key, []byte(value), timeStamp); err != nil {
+			t.Errorf("Write failed %v", err)
+		}
 
-	if err := store.writeEntry(entry, key, []byte(value), timeStamp); err != nil {
-		t.Errorf("Write failed %v", err)
+		store.Close()
+
+		entryFile, _ := os.ReadFile(filepath.Join(directory, "0.data"))
+
+		extractedKey, _ := ExtractKey(entryFile)
+		extractedValue, _ := ExtractValue(entryFile)
+
+		if string(extractedKey) != key {
+			t.Errorf("Expected %s, but got %s as a key", key, extractedKey)
+		}
+		if string(extractedValue) != value {
+			t.Errorf("Expected %s, but got %s as a key", value, &extractedValue)
+		}
+
+		if VerifyEntryCRC(entryFile) != nil {
+			t.Error("CRC check failed!")
+		}
+
+	})
+
+	t.Run("Successful write with correct position", func(t *testing.T) {
+		store, directory := setupTestStore(t, false)
+
+		writeTestEntry(t, store, "key1", []byte("value1"))
+		writeTestEntry(t, store, "key2", []byte("value2"))
+
+		record := assertKeyInKeyDir(t, store, "key1")
+
+		if record.ValueSize != 6 {
+			t.Errorf("wrong ValueSize: got %d, want 6", record.ValueSize)
+		}
+		store.Close()
+
+		entryFile, _ := os.ReadFile(filepath.Join(directory, "0.data"))
+
+		firstEntry := entryFile[:HEADER_SIZE+10]
+		secondEntry := entryFile[HEADER_SIZE+10:]
+
+		if err := VerifyEntryCRC(firstEntry); err != nil {
+			t.Errorf("FirstEntry: CRC verification failed: %v", err)
+		}
+
+		if err := VerifyEntryCRC(secondEntry); err != nil {
+			t.Errorf("SecondEntry: CRC verification failed: %v", err)
+		}
+
+		fV, _ := ExtractValue(firstEntry)
+		sV, _ := ExtractValue(secondEntry)
+
+		if string(fV) != "value1" {
+			t.Error("First entry value is wrong")
+		}
+
+		if string(sV) != "value2" {
+			t.Error("Second entry value is wrong")
+		}
+	})
+
+}
+
+func TestWriteEntry_ValuePosition(t *testing.T) {
+	tempDir := t.TempDir()
+	store, _ := Open(tempDir, OSFileSystem{}, false)
+	defer store.Close()
+
+	tests := []struct {
+		key   string
+		value []byte
+	}{
+		{"a", []byte("x")},
+		{"short", []byte("value")},
+		{"medium-length-key", []byte("some value here")},
+		{strings.Repeat("k", 100), []byte("value")},
 	}
 
+	for _, tt := range tests {
+		t.Run(tt.key, func(t *testing.T) {
+			timestamp := uint64(time.Now().Unix())
+			entry := InitEntry([]byte(tt.key), tt.value, timestamp)
+
+			positionBefore, _ := store.currentFile.Seek(0, io.SeekCurrent)
+
+			err := store.writeEntry(entry, tt.key, tt.value, timestamp)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			record := store.KeyDir[tt.key]
+
+			expectedValuePos := positionBefore + int64(HEADER_SIZE) + int64(len(tt.key))
+
+			if record.ValuePos != uint64(expectedValuePos) {
+				t.Errorf("wrong ValuePos: got %d, want %d", record.ValuePos, expectedValuePos)
+			}
+
+			store.currentFile.Seek(int64(record.ValuePos), io.SeekStart)
+			valueRead := make([]byte, record.ValueSize)
+			store.currentFile.Read(valueRead)
+
+			if !bytes.Equal(valueRead, tt.value) {
+				t.Error("value at ValuePos doesn't match")
+			}
+		})
+	}
+}
+func TestWriteEntry_EdgeCases(t *testing.T) {
+	t.Run("nil currentFile", func(t *testing.T) {
+		store := &Store{
+			store: &store{
+				currentFile: nil, // Not initialized
+				KeyDir:      make(map[string]LatestEntryRecord),
+			},
+		}
+
+		entry := InitEntry([]byte("key"), []byte("value"), 123)
+		err := store.writeEntry(entry, "key", []byte("value"), 123)
+
+		if err == nil {
+			t.Error("expected error with nil currentFile")
+		}
+	})
+
+	t.Run("multiple writes to same key", func(t *testing.T) {
+		tempDir := t.TempDir()
+		store, _ := Open(tempDir, OSFileSystem{}, false)
+		defer store.Close()
+
+		key := "key"
+
+		entry1 := InitEntry([]byte(key), []byte("value1"), 100)
+		store.writeEntry(entry1, key, []byte("value1"), 100)
+
+		record1 := store.KeyDir[key]
+
+		entry2 := InitEntry([]byte(key), []byte("value2"), 200)
+		store.writeEntry(entry2, key, []byte("value2"), 200)
+
+		record2 := store.KeyDir[key]
+
+		if record1.ValuePos == record2.ValuePos {
+			t.Error("expected different positions for overwrites")
+		}
+
+		if record2.Timestamp != 200 {
+			t.Errorf("timestamp not updated: got %d, want 200", record2.Timestamp)
+		}
+	})
+
+	t.Run("concurrent writes are serialized", func(t *testing.T) {
+		tempDir := t.TempDir()
+		store, _ := Open(tempDir, OSFileSystem{}, false)
+		defer store.Close()
+
+		var wg sync.WaitGroup
+		numWrites := 100
+
+		for i := 0; i < numWrites; i++ {
+			wg.Add(1)
+			go func(n int) {
+				defer wg.Done()
+				key := fmt.Sprintf("key%d", n)
+				value := []byte(fmt.Sprintf("value%d", n))
+				timestamp := uint64(n)
+				entry := InitEntry([]byte(key), value, timestamp)
+
+				store.writeEntry(entry, key, value, timestamp)
+			}(i)
+		}
+
+		wg.Wait()
+
+		if len(store.KeyDir) != numWrites {
+			t.Errorf("expected %d keys, got %d", numWrites, len(store.KeyDir))
+		}
+	})
 }
