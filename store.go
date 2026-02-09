@@ -7,8 +7,10 @@ import (
 	"hash/crc32"
 	"io"
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -353,8 +355,22 @@ func (s *store) Get(key string) ([]byte, error) {
 	return buf, nil
 }
 
-func (*store) ListKeys() ([]string, error) {
-	return nil, nil
+func (s *store) ListKeys() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return slices.Collect(maps.Keys(s.KeyDir))
+}
+
+func (s *Store) Sync() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.currentFile == nil {
+		return fmt.Errorf("Current file is nil")
+	}
+	if err := s.currentFile.Sync(); err != nil {
+		return fmt.Errorf("syncing data file: %w", err)
+	}
+	return nil
 }
 
 var (
@@ -386,9 +402,6 @@ func (s *Store) Delete(key string) error {
 }
 
 func (*Store) Merge(directoryName string) error {
-	return nil
-}
-func (*Store) Sync() error {
 	return nil
 }
 

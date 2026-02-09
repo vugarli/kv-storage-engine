@@ -10,6 +10,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -603,5 +604,30 @@ func TestIsTombStoneEntry(t *testing.T) {
 	}
 	if !b {
 		t.Error("Expected entry to be tombstone entry")
+	}
+}
+
+func TestListKeys(t *testing.T) {
+
+	store, _ := Open(".", MockFileSystem{}, false)
+	entries := []struct {
+		key string
+	}{
+		{key: "key"},
+		{key: "XX"},
+		{key: "key"},
+		{key: "XXX"},
+		{key: "key"},
+	}
+	for _, e := range entries {
+		store.KeyDir[e.key] = LatestEntryRecord{}
+	}
+	expected := []string{"key", "XX", "XXX"}
+	got := store.ListKeys()
+	slices.Sort(got)
+	slices.Sort(expected)
+
+	if slices.Compare(got, expected) != 0 {
+		t.Errorf("Expected %v, but got %v", expected, got)
 	}
 }
