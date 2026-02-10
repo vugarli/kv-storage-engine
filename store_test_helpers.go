@@ -1,6 +1,10 @@
 package main
 
 import (
+	"fmt"
+	"math"
+	"os"
+	"slices"
 	"testing"
 )
 
@@ -36,6 +40,26 @@ func setupTestStore(t *testing.T, syncOnPut bool) (*Store, string) {
 	return store, tempDir
 }
 
+func assertFileSize(t *testing.T, path string, size int, message string) {
+	fileStat, _ := os.Stat(path)
+	if size != int(fileStat.Size()) {
+		t.Errorf(message, size, fileStat.Size())
+	}
+}
+
+func assertInList[T comparable](t *testing.T, entry T, list []T, message string) {
+	if slices.Index(list, entry) == -1 {
+		t.Errorf(message, entry)
+	}
+}
+func assertNotInList[T comparable](t *testing.T, entry T, list []T, message string) {
+	if slices.Index(list, entry) != -1 {
+		t.Errorf(message, entry)
+	}
+}
+
+// Warning! During testing, generated timestamps will be same. Because of this, stale, and updated entries will be treated as same.
+// Use writeTestEntryWithTimeStamp tp have sequential entry timestamps
 func writeTestEntry(t *testing.T, store *Store, key string, value []byte) {
 	t.Helper()
 
@@ -51,6 +75,7 @@ func writeTestEntryWithTimeStamp(t *testing.T, store *Store, key string, value [
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	record, err := store.writeEntry(entry, key, value, timestamp)
+	store.currentSize += uint32(len(entry))
 
 	if err != nil {
 		t.Fatalf("writeEntry failed: %v", err)
@@ -67,6 +92,40 @@ func assertKeyInKeyDir(t *testing.T, store *Store, key string) LatestEntryRecord
 	}
 
 	return record
+}
+
+// Ensures that current active file becomes inactive (forces file rotation), by Puting "blank" entries.
+// Setting isTemp to false will make sure that all inserted "blank" entries get persisted after merge operation
+// Setting isTemp to true will guarantee that at least one entry will be preserved after merge operation
+// keySuffix is keyvalue that will be used for entries. In the case of isTemp false entry keys are formatted: %dkeySuffix
+//
+// Returns: number of entries inserted, and latest written entry key
+func ensureFileRotationHappens(t *testing.T, store *Store, isTemp bool, keySuffix string) (uint32, int) {
+	sizeOfEntryValue := 1 << 30 // 1GB
+	temp := float64(MAXIMUM_FILE_SIZE-store.currentSize) / float64(sizeOfEntryValue)
+	numberOfEntriesNeeded := math.Ceil(temp)
+	var entryKey string
+	for i := 0; i < int(numberOfEntriesNeeded); i++ {
+
+		entryKey = fmt.Sprintf("%d%s", i, keySuffix)
+		if isTemp {
+			entryKey = keySuffix
+		}
+
+		writeTestEntry(t, store, entryKey, make([]byte, sizeOfEntryValue))
+	}
+	return uint32(numberOfEntriesNeeded), sizeOfEntryValue
+}
+
+func assertEntryExistsKeyValue(t *testing.T, store *Store, key, value string) {
+	t.Helper()
+	v, err := store.Get(key)
+	if err != nil {
+		t.Errorf("Unexpected Get error key:%s err:%v", key, err)
+	}
+	if string(v) != value {
+		t.Errorf("For key:%s expected value: %s, but got %s", key, value, string(v))
+	}
 }
 
 func assertKeyNotInKeyDir(t *testing.T, store *Store, key string) {

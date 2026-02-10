@@ -346,5 +346,110 @@ func TestDelete(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestMerge(t *testing.T) {
+	t.Run("Succsessfully compacts SINGLE FILE by removing stale entries", func(t *testing.T) {
+		entries := []struct {
+			key   string
+			value string
+		}{
+			{key: "key", value: "value1"},
+			{key: "XX", value: "value"},
+			{key: "key", value: "value2"},
+			{key: "XXX", value: "value"},
+			{key: "key", value: "value3"},
+		}
+
+		store, directory := setupTestStore(t, false)
+
+		for i, entry := range entries {
+			writeTestEntryWithTimeStamp(t, store, entry.key, []byte(entry.value), uint64(i))
+		}
+
+		_, size := ensureFileRotationHappens(t, store, true, "key3")
+
+		if err := store.Merge(); err != nil {
+			t.Error("Failed to Merge")
+		}
+		store.Close()
+
+		// check size to make sure single file compacted
+		fileStat, _ := os.Stat(path.Join(directory, "0.data"))
+		expectedSize := (HEADER_SIZE * 4) + 12 + 16 + size
+		if expectedSize != int(fileStat.Size()) {
+			t.Errorf("Expected compaction didn't happen. Expected file size:%d, but got:%d", expectedSize, fileStat.Size())
+		}
+		fileStat1, _ := os.Stat(path.Join(directory, "1.data"))
+		expectedSize1 := 0
+
+		if expectedSize1 != int(fileStat1.Size()) {
+			t.Errorf("Latest active file size is wrong: expected:%d got:%d", expectedSize1, fileStat1.Size())
+		}
+
+		// test only updated entries remain
+		store = openTestStore(t, true, directory)
+
+		assertEntryExistsKeyValue(t, store, "key", "value3")
+		assertEntryExistsKeyValue(t, store, "XX", "value")
+		assertEntryExistsKeyValue(t, store, "XXX", "value")
+		assertKeyInKeyDir(t, store, "key3")
+	})
+
+	t.Run("Succsessfully compacts MULTIPLE FILES TO SINGLE FILE by removing stale entries", func(t *testing.T) {
+		entries := []struct {
+			key   string
+			value string
+		}{
+			{key: "key", value: "value1"},
+			{key: "XX", value: "value"},
+			{key: "key", value: "value2"},
+			{key: "XXX", value: "value"},
+			{key: "key", value: "value3"},
+		}
+
+		store, directory := setupTestStore(t, false)
+
+		for i, entry := range entries {
+			writeTestEntryWithTimeStamp(t, store, entry.key, []byte(entry.value), uint64(i))
+		}
+		_, size := ensureFileRotationHappens(t, store, true, "key3")
+		// active: 1.data.
+		// inactive: 0.data. 5 entries + N key3 entries
+
+		_, size2 := ensureFileRotationHappens(t, store, true, "key4")
+		// active: 2.data.
+		// inactive: 0.data. 5 entries + N key3 entries
+		// inactive: 1.data. 2 key4 entries
+
+		if err := store.Merge(); err != nil {
+			t.Error("Failed to Merge")
+		}
+		// remaining files: 2.data, 1.data
+		// 2.data
+		// 1.data 1 key3 + 1 key4 + 3 entries
+		store.Close()
+
+		dirEntries, _ := filepath.Glob(path.Join(directory, "*.data"))
+		assertInList(t, filepath.Join(directory, "2.data"), dirEntries, "Expected %s file in directory, but file were not present")
+		assertInList(t, filepath.Join(directory, "1.data"), dirEntries, "Expected %s file in directory, but file were not present")
+		assertNotInList(t, filepath.Join(directory, "0.data"), dirEntries, "Didn't expect %s file in directory, but file were present")
+
+		data1ExpectedSize := (HEADER_SIZE * 5) + 3 + 2 + 3 + 4 + 4 + (6 + 5 + 5 + size + size2)
+		assertFileSize(t, path.Join(directory, "1.data"), data1ExpectedSize, "Expected compaction didn't happen. Expected file size:%d, but got:%d")
+
+		data2ExpectedSize := 0
+		assertFileSize(t, path.Join(directory, "2.data"), data2ExpectedSize, "Expected compaction didn't happen. Expected file size:%d, but got:%d")
+
+		// test only updated entries remain
+		store = openTestStore(t, true, directory)
+
+		assertEntryExistsKeyValue(t, store, "key", "value3")
+		assertEntryExistsKeyValue(t, store, "XX", "value")
+		assertEntryExistsKeyValue(t, store, "XXX", "value")
+		//assertEntryExistsKeyValue(t, store, "key3", strings.Repeat("\x00", size))
+		assertKeyInKeyDir(t, store, "key3")
+		assertKeyInKeyDir(t, store, "key4")
+	})
 
 }

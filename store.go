@@ -135,11 +135,6 @@ func (s *Store) writeEntry(entry []byte, key string, value []byte, timestamp uin
 
 	valuePosition := position + int64(HEADER_SIZE) + int64(len(keyByte))
 
-	// s.KeyDir[string(keyByte)] = LatestEntryRecord{
-	// 	FileId:    s.currentFileId,
-	// 	ValueSize: uint32(len(value)),
-	// 	ValuePos:  uint64(valuePosition),
-	// 	Timestamp: timestamp}
 	entryRecord := LatestEntryRecord{
 		FileId:    s.currentFileId,
 		ValueSize: uint32(len(value)),
@@ -152,10 +147,7 @@ func (s *Store) writeEntry(entry []byte, key string, value []byte, timestamp uin
 		}
 	}
 
-	//TODO file rotation? if bigger than max size
-
 	return &entryRecord, nil
-
 }
 
 func extractFileId(a string) (uint32, error) {
@@ -254,7 +246,10 @@ func (s *store) loadEntriesFromFile(filePath string) error {
 
 		dataSize := int(entryHeader.KeySize + entryHeader.ValueSize)
 		dataBuf := make([]byte, dataSize)
-		n, err = file.Read(dataBuf)
+		//n, err = file.Read(dataBuf)
+		n, err = io.ReadFull(file, dataBuf)
+		//TODO check for other Read and replace
+
 		if err != nil && err != io.EOF {
 			return fmt.Errorf("reading entry data at offset %d: %w", offset, err)
 		}
@@ -304,6 +299,9 @@ func (s *store) loadEntriesFromFile(filePath string) error {
 func (s *Store) Put(key string, value []byte) error {
 	if key == "" {
 		return fmt.Errorf("Key can't be empty string")
+	}
+	if len(value) > MAXIMUM_FILE_SIZE {
+		return fmt.Errorf("value can't be bigger than %d bytes", MAXIMUM_FILE_SIZE)
 	}
 
 	s.mu.Lock()
@@ -413,7 +411,7 @@ func (s *Store) Delete(key string) error {
 	return nil
 }
 
-func (*Store) Merge(directoryName string) error {
+func (*Store) Merge() error {
 	return nil
 }
 
