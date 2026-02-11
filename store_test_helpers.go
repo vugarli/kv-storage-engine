@@ -83,7 +83,7 @@ func writeTestEntryWithTimeStamp(t *testing.T, store *Store, key string, value [
 	store.KeyDir[key] = *record
 }
 
-func assertKeyInKeyDir(t *testing.T, store *Store, key string) LatestEntryRecord {
+func assertKeyInKeyDir(t *testing.T, store *Store, key string) EntryRecord {
 	t.Helper()
 
 	record, exists := store.KeyDir[key]
@@ -115,6 +115,20 @@ func ensureFileRotationHappens(t *testing.T, store *Store, isTemp bool, keySuffi
 		writeTestEntry(t, store, entryKey, make([]byte, sizeOfEntryValue))
 	}
 	return uint32(numberOfEntriesNeeded), sizeOfEntryValue
+}
+
+func createMockEntriesGivenValueSizes(t *testing.T, valueSizes []int, keySize int) []MergeEntryRecord {
+	t.Helper()
+	var records = make([]MergeEntryRecord, 0, len(valueSizes))
+
+	for _, valueSize := range valueSizes {
+		records = append(records, MergeEntryRecord{
+			Record: EntryRecord{
+				KeySize:   uint32(keySize),
+				ValueSize: uint32(valueSize)},
+			Key: "1key"})
+	}
+	return records
 }
 
 func assertEntryExistsKeyValue(t *testing.T, store *Store, key, value string) {

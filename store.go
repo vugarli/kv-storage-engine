@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"io"
 	"io/fs"
 	"maps"
+	"math"
 	"os"
 	"path/filepath"
 	"slices"
@@ -26,7 +28,7 @@ type FileSystem interface {
 	ReadDir(name string) ([]fs.DirEntry, error)
 	acquireExclusiveLock(directory string) (*os.File, error)
 	acquireSharedLock(directory string) (*os.File, error)
-	getNewFileId(directory string) (uint32, error)
+	getNewFileId(directory string) (int, error)
 }
 
 type OSFileSystem struct{}
@@ -73,20 +75,40 @@ type FileLike interface {
 	Truncate(size int64) error
 }
 
-type LatestEntryRecord struct {
-	FileId    uint32
+type EntryRecord struct {
+	FileId    int
 	ValueSize uint32
 	ValuePos  uint64
 	Timestamp uint64
+	KeySize   uint32
 }
 
-const MAXIMUM_FILE_SIZE = 2 * 1024 * 1024 * 1024 // 2GB
+type Entry struct {
+	Key         string
+	IsTombEntry bool
+	ValueSize   uint32
+	ValuePos    uint32
+}
+
+// Its assumed that single entry will never be bigger than 4GB
+
+const MAXIMUM_FILE_SIZE = 2 * 1024 * 1024 * 1024        // 2GB
+const MAXIMUM_MERGED_FILE_SIZE = 4 * 1024 * 1024 * 1024 // 4GB
+const MAX_KEY_SIZE = 1 * 1024                           // 1Kb
+const MAX_VALUE_SIZE = 1 * 1024 * 1024 * 1024           // 1GB
+
+var (
+	ErrEmptyKey      = errors.New("key cannot be empty")
+	ErrKeyTooLarge   = errors.New("key exceeds maximum size")
+	ErrValueTooLarge = errors.New("value exceeds maximum size")
+	ErrEntryTooLarge = errors.New("entry exceeds maximum file size")
+)
 
 type store struct {
 	DirectoryName string
-	KeyDir        map[string]LatestEntryRecord
+	KeyDir        map[string]EntryRecord
 	lockFile      *os.File
-	currentFileId uint32
+	currentFileId int
 	mu            sync.RWMutex
 	fileSystem    FileSystem
 	currentFile   FileLike
@@ -102,7 +124,7 @@ type ReadOnlyStore struct {
 	*store
 }
 
-func (s *Store) writeEntry(entry []byte, key string, value []byte, timestamp uint64) (*LatestEntryRecord, error) {
+func (s *Store) writeEntry(entry []byte, key string, value []byte, timestamp uint64) (*EntryRecord, error) {
 	if key == "" {
 		return nil, fmt.Errorf("Key can't be empty string")
 	}
@@ -135,11 +157,13 @@ func (s *Store) writeEntry(entry []byte, key string, value []byte, timestamp uin
 
 	valuePosition := position + int64(HEADER_SIZE) + int64(len(keyByte))
 
-	entryRecord := LatestEntryRecord{
+	entryRecord := EntryRecord{
 		FileId:    s.currentFileId,
 		ValueSize: uint32(len(value)),
 		ValuePos:  uint64(valuePosition),
-		Timestamp: timestamp}
+		Timestamp: timestamp,
+		KeySize:   uint32(len(key)),
+	}
 
 	if s.syncOnPut {
 		if err := s.currentFile.Sync(); err != nil {
@@ -150,7 +174,7 @@ func (s *Store) writeEntry(entry []byte, key string, value []byte, timestamp uin
 	return &entryRecord, nil
 }
 
-func extractFileId(a string) (uint32, error) {
+func extractFileId(a string) (int, error) {
 	start := -1
 	end := -1
 
@@ -168,31 +192,24 @@ func extractFileId(a string) (uint32, error) {
 	if start != -1 {
 		digit := a[start:end]
 		num, _ := strconv.Atoi(digit)
-		return uint32(num), nil
+		return num, nil
 	}
 	return 0, fmt.Errorf("data file format is wrong")
 }
 
 func (s *store) updateKeyDir() error {
-	dirEntries, err := s.fileSystem.ReadDir(s.DirectoryName)
+	dataFileIds, err := s.getInactiveDataFileIds()
 	if err != nil {
-		return fmt.Errorf("reading store directory: %w", err)
+		return fmt.Errorf("Error while getting inactive data files: %w", err)
 	}
-	dataFiles := make([]string, 0, len(dirEntries))
-	for _, dirEntry := range dirEntries {
-		if !dirEntry.IsDir() && strings.HasSuffix(dirEntry.Name(), ".data") { //TODO check for current id
-			dataFiles = append(dataFiles, dirEntry.Name())
-		}
-	}
-
-	for _, dataFile := range dataFiles {
-		filepath := filepath.Join(s.DirectoryName, dataFile)
+	for _, dataFileId := range dataFileIds {
+		dataFileName := fmt.Sprintf("%d.data", dataFileId)
+		filepath := filepath.Join(s.DirectoryName, dataFileName)
 
 		if err := s.loadEntriesFromFile(filepath); err != nil {
-			fmt.Printf("Warning: error loading %s: %v", dataFile, err)
+			fmt.Printf("Warning: error loading %s: %v", dataFileName, err)
 		}
 	}
-
 	return nil
 }
 
@@ -282,11 +299,12 @@ func (s *store) loadEntriesFromFile(filePath string) error {
 
 		existing, exists := s.KeyDir[key]
 		if !exists || (exists && entryHeader.Timestamp > existing.Timestamp) {
-			s.KeyDir[key] = LatestEntryRecord{
+			s.KeyDir[key] = EntryRecord{
 				FileId:    fileId,
 				ValueSize: entryHeader.ValueSize,
 				ValuePos:  uint64(valuePos),
 				Timestamp: entryHeader.Timestamp,
+				KeySize:   uint32(len(key)),
 			}
 		}
 
@@ -296,12 +314,39 @@ func (s *store) loadEntriesFromFile(filePath string) error {
 	return nil
 }
 
-func (s *Store) Put(key string, value []byte) error {
+func validatePut(key string, value []byte) error {
 	if key == "" {
-		return fmt.Errorf("Key can't be empty string")
+		return ErrEmptyKey
 	}
-	if len(value) > MAXIMUM_FILE_SIZE {
-		return fmt.Errorf("value can't be bigger than %d bytes", MAXIMUM_FILE_SIZE)
+
+	if len(key) > MAX_KEY_SIZE {
+		return fmt.Errorf("key size %d exceeds maximum %d: %w",
+			len(key), MAX_KEY_SIZE, ErrKeyTooLarge)
+	}
+
+	if len(value) > MAX_VALUE_SIZE {
+		return fmt.Errorf("value size %d exceeds maximum %d: %w",
+			len(value), MAX_VALUE_SIZE, ErrValueTooLarge)
+	}
+
+	if uint64(len(value)+len(key)+HEADER_SIZE) > uint64(math.MaxUint32) {
+		return fmt.Errorf("entry size %d exceeds uint32 max: %w",
+			len(value), ErrValueTooLarge)
+	}
+
+	entrySize := HEADER_SIZE + len(key) + len(value)
+	if int64(entrySize) > MAXIMUM_FILE_SIZE {
+		return fmt.Errorf("entry size %d exceeds max file size %d: %w",
+			entrySize, MAXIMUM_FILE_SIZE, ErrEntryTooLarge)
+	}
+
+	return nil
+}
+
+func (s *Store) Put(key string, value []byte) error {
+
+	if err := validatePut(key, value); err != nil {
+		return err
 	}
 
 	s.mu.Lock()
@@ -411,8 +456,184 @@ func (s *Store) Delete(key string) error {
 	return nil
 }
 
-func (*Store) Merge() error {
+func (s *Store) Merge() error {
+	dataFileIds, err := s.getInactiveDataFileIds()
+	if err != nil {
+		return fmt.Errorf("Error while getting inactive data files: %w", err)
+	}
+
+	var entries []MergeEntryRecord
+
+	//TODO consider locking!
+	for key, record := range maps.All(s.KeyDir) {
+		if slices.Index(dataFileIds, record.FileId) != -1 {
+			entries = append(entries, MergeEntryRecord{
+				Record: record,
+				Key:    key,
+			})
+		}
+	}
+
+	groups := groupEntriesFFD(entries, MAXIMUM_MERGED_FILE_SIZE)
+
+	return writeGroupsToFiles(groups, dataFileIds)
+}
+
+type MergeEntryRecord struct {
+	Record EntryRecord
+	Key    string
+}
+
+func writeGroupsToFiles(groups [][]MergeEntryRecord, dataFileIds []int) error {
+	slices.SortFunc(dataFileIds, func(a, b int) int {
+		return cmp.Compare(b, a)
+	})
+
+	// for _, dataFileId := range dataFileIds {
+	// 	fileName := fmt.Sprintf("%d.data.temp", dataFileId)
+	// 	// read entry
+	// 	// write entry
+
+	// }
 	return nil
+}
+
+func (e EntryRecord) EntrySize() int64 {
+	return int64(HEADER_SIZE) + int64(e.KeySize) + int64(e.ValueSize)
+}
+
+// Groups entries in FFD order so that no group exceeds maxSize
+func groupEntriesFFD(entries []MergeEntryRecord, maxSize int64) [][]MergeEntryRecord {
+	sorted := make([]MergeEntryRecord, len(entries))
+	copy(sorted, entries)
+	slices.SortFunc(sorted, func(a, b MergeEntryRecord) int {
+		return cmp.Compare(b.Record.EntrySize(), a.Record.EntrySize())
+	})
+
+	var groups [][]MergeEntryRecord
+	var currentGroup []MergeEntryRecord
+	currentSize := int64(0)
+
+	for _, entry := range sorted {
+		entrySize := entry.Record.EntrySize()
+
+		if entrySize >= maxSize {
+			if len(currentGroup) > 0 {
+				groups = append(groups, currentGroup)
+				currentGroup = nil
+				currentSize = 0
+			}
+			groups = append(groups, []MergeEntryRecord{entry})
+			continue
+		}
+
+		if currentSize+entrySize <= maxSize {
+			currentGroup = append(currentGroup, entry)
+			currentSize += entrySize
+			continue
+		}
+
+		groups = append(groups, currentGroup)
+		currentGroup = []MergeEntryRecord{entry}
+		currentSize = entrySize
+	}
+
+	if len(currentGroup) > 0 {
+		groups = append(groups, currentGroup)
+	}
+
+	return groups
+}
+
+// func readEntry(reader io.ReaderAt, offset uint32) (EntryRecord, error) {
+
+// 	headerBuf := make([]byte, HEADER_SIZE)
+// 	n, err := reader.ReadAt(headerBuf, int64(offset))
+// 	if err == io.EOF {
+// 		return EntryRecord{}, err
+// 	}
+// 	if err != nil {
+// 		return EntryRecord{}, fmt.Errorf("Read: %d/%d bytes. Reading header at offset %d: %w", n, HEADER_SIZE, offset, err)
+// 	}
+
+// 	entryHeader, err := ParseEntryHeader(headerBuf)
+// 	if err != nil {
+// 		return EntryRecord{}, fmt.Errorf("parsing header at offset %d: %w", offset, err)
+// 	}
+
+// 	dataSize := int(entryHeader.KeySize + entryHeader.ValueSize)
+// 	dataBuf := make([]byte, dataSize)
+// 	n, err = reader.ReadAt(dataBuf, int64(offset)+HEADER_SIZE)
+// 	if err == io.EOF {
+// 		return EntryRecord{}, err
+// 	}
+// 	if err != nil {
+// 		return EntryRecord{}, fmt.Errorf("Read: %d/%d bytes. Reading entry data at offset %d: %w", n, HEADER_SIZE, offset, err)
+// 	}
+
+// 	fullEntry := make([]byte, HEADER_SIZE+dataSize)
+// 	copy(fullEntry, headerBuf)
+// 	copy(fullEntry[HEADER_SIZE:], dataBuf)
+
+// 	if err := VerifyEntryCRC(fullEntry); err != nil {
+// 		offset += HEADER_SIZE + dataSize
+// 		return EntryRecord{}, fmt.Errorf("Warning: CRC mismatch at offset %d", offset)
+// 	}
+// 	key := string(dataBuf[:entryHeader.KeySize])
+
+// 	isTomb, err := isTombStoneEntry(fullEntry)
+// 	if err != nil {
+// 		fmt.Printf("Error while checking if entry is tombstone entry: %v", err)
+// 	}
+// 	if isTomb {
+// 		entryRecord := EntryRecord{
+// 			Key:    key,
+// 			FileId: fileId,
+// 		}
+
+// 	}
+
+// 	valuePos := offset + int64(HEADER_SIZE) + int64(entryHeader.KeySize)
+
+// 	existing, exists := s.KeyDir[key]
+// 	if !exists || (exists && entryHeader.Timestamp > existing.Timestamp) {
+// 		s.KeyDir[key] = LatestEntryRecord{
+// 			FileId:    fileId,
+// 			ValueSize: entryHeader.ValueSize,
+// 			ValuePos:  uint64(valuePos),
+// 			Timestamp: entryHeader.Timestamp,
+// 		}
+// 	}
+
+// 	offset += int64(HEADER_SIZE + dataSize)
+
+// }
+
+// Returns files with *.data pattern in store directory. Ignores current active file.
+func (s *store) getInactiveDataFileIds() ([]int, error) {
+	dirEntries, err := s.fileSystem.ReadDir(s.DirectoryName)
+	if err != nil {
+		return nil, fmt.Errorf("reading store directory: %w", err)
+	}
+
+	dataFiles := make([]string, 0, len(dirEntries))
+	for _, dirEntry := range dirEntries {
+		if !dirEntry.IsDir() && strings.HasSuffix(dirEntry.Name(), ".data") {
+			if fmt.Sprintf("%d.data", s.currentFileId) != dirEntry.Name() { //TODO optimize check
+				dataFiles = append(dataFiles, dirEntry.Name())
+			}
+		}
+	}
+	dataFilesInts := make([]int, 0, len(dataFiles))
+	for _, dataFile := range dataFiles {
+		a, err := extractFileId(dataFile)
+		if err != nil {
+			return nil, err
+		}
+		dataFilesInts = append(dataFilesInts, a)
+	}
+
+	return dataFilesInts, nil
 }
 
 func (s *Store) rotateFile() error {
@@ -492,12 +713,12 @@ func (s *store) Close() error {
 	return nil
 }
 
-func (of OSFileSystem) getNewFileId(directory string) (uint32, error) {
+func (of OSFileSystem) getNewFileId(directory string) (int, error) {
 	entries, err := os.ReadDir(directory)
 	if err != nil {
 		return 0, fmt.Errorf("reading the directory: %w", err)
 	}
-	var maxId uint32 = 0
+	var maxId int = 0
 	foundAny := false
 	for _, entry := range entries {
 		fi, err := entry.Info()
@@ -505,10 +726,10 @@ func (of OSFileSystem) getNewFileId(directory string) (uint32, error) {
 			return 0, fmt.Errorf("reading the file: %w", err)
 		}
 		if s, f := strings.CutSuffix(fi.Name(), ".data"); f {
-			if id, err := strconv.ParseUint(s, 10, 32); err == nil {
+			if id, err := strconv.Atoi(s); err == nil {
 				foundAny = true
-				if uint32(id) > maxId {
-					maxId = uint32(id)
+				if id > maxId {
+					maxId = id
 				}
 			}
 		}
@@ -519,7 +740,7 @@ func (of OSFileSystem) getNewFileId(directory string) (uint32, error) {
 	return maxId, nil
 }
 
-func createNewDataFile(newFileId uint32, directory string, fileSystem FileSystem) (*os.File, error) {
+func createNewDataFile(newFileId int, directory string, fileSystem FileSystem) (*os.File, error) {
 	newFilePath := filepath.Join(directory, fmt.Sprintf("%d.data", newFileId))
 	f, err := fileSystem.Create(newFilePath)
 	if err != nil {
@@ -554,7 +775,7 @@ func Open(directory string, fileSystem FileSystem, syncOnPut bool) (*Store, erro
 	store := &Store{
 		store: &store{
 			DirectoryName: directory,
-			KeyDir:        make(map[string]LatestEntryRecord),
+			KeyDir:        make(map[string]EntryRecord),
 			lockFile:      lockFile,
 			currentFileId: newFileId,
 			fileSystem:    fileSystem,
@@ -582,7 +803,7 @@ func OpenReadOnly(directory string, fileSystem FileSystem) (*ReadOnlyStore, erro
 	store := &ReadOnlyStore{
 		store: &store{
 			DirectoryName: directory,
-			KeyDir:        make(map[string]LatestEntryRecord),
+			KeyDir:        make(map[string]EntryRecord),
 			lockFile:      lockFile,
 			currentFileId: newFileId,
 			fileSystem:    fileSystem,

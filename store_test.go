@@ -392,7 +392,7 @@ func TestWriteEntry_EdgeCases(t *testing.T) {
 		store := &Store{
 			store: &store{
 				currentFile: nil,
-				KeyDir:      make(map[string]LatestEntryRecord),
+				KeyDir:      make(map[string]EntryRecord),
 			},
 		}
 
@@ -540,7 +540,7 @@ func TestExtractFileId(t *testing.T) {
 	cases := []struct {
 		testTitle string
 		name      string
-		expected  uint32
+		expected  int
 		fails     bool
 	}{
 		{testTitle: "Success", name: "0.data", expected: 0},
@@ -620,7 +620,7 @@ func TestListKeys(t *testing.T) {
 		{key: "key"},
 	}
 	for _, e := range entries {
-		store.KeyDir[e.key] = LatestEntryRecord{}
+		store.KeyDir[e.key] = EntryRecord{}
 	}
 	expected := []string{"key", "XX", "XXX"}
 	got := store.ListKeys()
@@ -629,5 +629,78 @@ func TestListKeys(t *testing.T) {
 
 	if slices.Compare(got, expected) != 0 {
 		t.Errorf("Expected %v, but got %v", expected, got)
+	}
+}
+
+func TestGroupEntriesFFD(t *testing.T) {
+
+	tests := []struct {
+		name          string
+		valueSizes    []int
+		maxSize       int
+		expectedSizes []int
+	}{
+		{
+			name:          "correct grouping when single entry size equals maxSize",
+			valueSizes:    []int{376, 26, 76, 76, 26, 26},
+			maxSize:       400,
+			expectedSizes: []int{400, 350},
+		},
+		{
+			name:       "gap filling (FFD logic)",
+			valueSizes: []int{300, 150, 70},
+			maxSize:    400,
+			// Sorted total sizes: 324, 174, 94
+			expectedSizes: []int{324, 268},
+		},
+		{
+			name:       "perfect multiples of maxSize",
+			valueSizes: []int{176, 176, 176, 176},
+			maxSize:    400,
+			// each is 200.
+			expectedSizes: []int{400, 400},
+		},
+		{
+			name:          "many small items in one bin",
+			valueSizes:    []int{26, 26, 26, 26, 26},
+			maxSize:       250,
+			expectedSizes: []int{250},
+		},
+		{
+			name:          "oversized item behavior",
+			valueSizes:    []int{500},
+			maxSize:       400,
+			expectedSizes: []int{524},
+		},
+		{
+			name:          "empty input",
+			valueSizes:    []int{},
+			maxSize:       400,
+			expectedSizes: []int{},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			entries := createMockEntriesGivenValueSizes(t, tt.valueSizes, 4)
+
+			groups := groupEntriesFFD(entries, int64(tt.maxSize))
+
+			if len(groups) != len(tt.expectedSizes) {
+				t.Errorf("expected %d groups, got %d", len(tt.expectedSizes), len(groups))
+				return
+			}
+
+			for i, group := range groups {
+				var actualGroupSize int
+				for _, entry := range group {
+					actualGroupSize += int(entry.Record.ValueSize) + int(entry.Record.KeySize) + HEADER_SIZE
+				}
+
+				if tt.expectedSizes[i] != actualGroupSize {
+					t.Errorf("group %d: expected total size %d, got %d", i, tt.expectedSizes[i], actualGroupSize)
+				}
+			}
+		})
 	}
 }
