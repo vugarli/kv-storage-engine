@@ -364,7 +364,7 @@ func TestEntryParsing(t *testing.T) {
 				t.Errorf("entry size = %d, want %d", len(entry), tt.wantSize)
 			}
 
-			extractedKey, err := ExtractKey(entry)
+			extractedKey, err := ExtractKeyGivenData(entry)
 			if err != nil {
 				t.Fatal(err)
 			}

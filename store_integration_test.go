@@ -28,7 +28,7 @@ func TestPut(t *testing.T) {
 
 		entryFile, _ := os.ReadFile(filepath.Join(directory, "0.data"))
 
-		extractedKey, _ := ExtractKey(entryFile)
+		extractedKey, _ := ExtractKeyGivenData(entryFile)
 		extractedValue, _ := ExtractValue(entryFile)
 
 		if string(extractedKey) != key {
@@ -481,9 +481,9 @@ func TestReadEntryFunc(t *testing.T) {
 
 	t.Run("read middle entry with correct offset", func(t *testing.T) {
 		offset := uint64(26)
-		entry, err := readEntry(file, offset)
+		entry, _, err := readEntry(file, offset)
 
-		key, _ := ExtractKey(entry)
+		key, _ := ExtractKeyGivenData(entry)
 
 		if err != nil {
 			t.Fatalf("Failed to read entry at offset %d: %v", offset, err)
@@ -495,8 +495,8 @@ func TestReadEntryFunc(t *testing.T) {
 
 	t.Run("read last entry", func(t *testing.T) {
 		offset := uint64(52)
-		entry, err := readEntry(file, offset)
-		key, _ := ExtractKey(entry)
+		entry, _, err := readEntry(file, offset)
+		key, _ := ExtractKeyGivenData(entry)
 
 		if err != nil {
 			t.Fatalf("Failed to read last entry: %v", err)
@@ -507,14 +507,14 @@ func TestReadEntryFunc(t *testing.T) {
 	})
 
 	t.Run("read beyond file limits", func(t *testing.T) {
-		_, err := readEntry(file, 100)
+		_, _, err := readEntry(file, 100)
 		if err == nil {
 			t.Error("Expected error when reading past EOF, got nil")
 		}
 	})
 
 	t.Run("read with corrupted/invalid offset", func(t *testing.T) {
-		_, err := readEntry(file, 5)
+		_, _, err := readEntry(file, 5)
 		if err == nil {
 			t.Error("Expected error when reading from an invalid offset, got nil")
 		}

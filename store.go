@@ -29,7 +29,6 @@ type FileSystem interface {
 	ReadDir(name string) ([]fs.DirEntry, error)
 	acquireExclusiveLock(directory string) (*os.File, error)
 	acquireSharedLock(directory string) (*os.File, error)
-	getNewFileId(directory string) (int, error)
 }
 
 type OSFileSystem struct{}
@@ -199,27 +198,22 @@ func extractFileId(a string) (int, error) {
 	return 0, fmt.Errorf("data file format is wrong")
 }
 
-func (s *store) updateKeyDir() error {
-	dataFileIds, err := s.getInactiveDataFileIds()
-	if err != nil {
-		return fmt.Errorf("Error while getting inactive data files: %w", err)
-	}
-	for _, dataFileId := range dataFileIds {
-		dataFileName := fmt.Sprintf("%d.data", dataFileId)
-		filepath := filepath.Join(s.DirectoryName, dataFileName)
+// Given inactive files, and updates KeyDir
+func generateKeyDirFromFileIds(directory string, inactiveDataFileIds []int) (map[string]EntryRecord, error) {
+	keyDir := make(map[string]EntryRecord)
 
-		if err := s.loadEntriesFromFile(filepath); err != nil {
+	for _, dataFileId := range inactiveDataFileIds {
+		dataFileName := fmt.Sprintf("%d.data", dataFileId)
+		filepath := filepath.Join(directory, dataFileName)
+
+		if err := populateKeyDirWEntriesFromFile(filepath, keyDir); err != nil {
 			fmt.Printf("Warning: error loading %s: %v", dataFileName, err)
 		}
 	}
-	return nil
+	return keyDir, nil
 }
 
 func isTombStoneEntry(header []byte) (bool, error) {
-	if len(header) < HEADER_SIZE {
-		return false, fmt.Errorf("Wrong entry size")
-	}
-
 	parsedHeader, err := ParseEntryHeader(header)
 	if err != nil {
 		return false, err
@@ -229,78 +223,50 @@ func isTombStoneEntry(header []byte) (bool, error) {
 	return timeStamp>>63 == 1 && parsedHeader.ValueSize == 0, nil
 }
 
-func (s *store) loadEntriesFromFile(filePath string) error {
+func populateKeyDirWEntriesFromFile(filePath string, keyDir map[string]EntryRecord) error {
 	filename := filepath.Base(filePath)
 	fileId, err := extractFileId(filename)
 	if err != nil {
 		return fmt.Errorf("extracting file ID from %s: %w", filename, err)
 	}
 
-	file, err := s.fileSystem.Open(filePath)
+	file, err := os.Open(filePath)
 	if err != nil {
 		return fmt.Errorf("opening file: %w", err)
 	}
 	defer file.Close()
 
-	offset := int64(0)
+	offset := uint64(0)
 
 	for {
-		headerBuf := make([]byte, HEADER_SIZE)
-		n, err := file.Read(headerBuf)
+
+		entry, entryHeader, err := readEntry(file, offset)
 		if err == io.EOF {
 			break
 		}
-		if err != nil {
-			return fmt.Errorf("reading header at offset %d: %w", offset, err)
-		}
-		if n != HEADER_SIZE {
-			fmt.Printf("Warning: incomplete header at offset %d in %s", offset, filePath)
-			break
+
+		var keyByte []byte
+		if keyByte, err = ExtractKeyGivenHeader(entry, *entryHeader); err != nil {
+			return err
 		}
 
-		entryHeader, err := ParseEntryHeader(headerBuf)
-		if err != nil {
-			return fmt.Errorf("parsing header at offset %d: %w", offset, err)
-		}
+		key := string(keyByte)
 
-		dataSize := int(entryHeader.KeySize + entryHeader.ValueSize)
-		dataBuf := make([]byte, dataSize)
-		n, err = io.ReadFull(file, dataBuf)
-		//TODO check for other Read and replace
-
-		if err != nil && err != io.EOF {
-			return fmt.Errorf("reading entry data at offset %d: %w", offset, err)
-		}
-		if n != dataSize {
-			fmt.Printf("Warning: incomplete entry at offset %d in %s", offset, filePath)
-			break
-		}
-
-		fullEntry := make([]byte, HEADER_SIZE+dataSize)
-		copy(fullEntry, headerBuf)
-		copy(fullEntry[HEADER_SIZE:], dataBuf)
-
-		if err := VerifyEntryCRC(fullEntry); err != nil {
-			fmt.Printf("Warning: CRC mismatch at offset %d in %s", offset, filePath)
-			offset += int64(HEADER_SIZE + dataSize)
-			continue
-		}
-		key := string(dataBuf[:entryHeader.KeySize])
-
-		isTomb, err := isTombStoneEntry(fullEntry)
+		isTomb, err := isTombStoneEntry(entry)
 		if err != nil {
 			fmt.Printf("Error while checking if entry is tombstone entry: %v", err)
 		}
 		if isTomb {
-			delete(s.KeyDir, key)
+			delete(keyDir, key)
+			offset += uint64(len(entry))
 			continue
 		}
 
-		valuePos := offset + int64(HEADER_SIZE) + int64(entryHeader.KeySize)
+		valuePos := offset + uint64(HEADER_SIZE) + uint64(entryHeader.KeySize)
 
-		existing, exists := s.KeyDir[key]
+		existing, exists := keyDir[key]
 		if !exists || (exists && entryHeader.Timestamp > existing.Timestamp) {
-			s.KeyDir[key] = EntryRecord{
+			keyDir[key] = EntryRecord{
 				FileId:    fileId,
 				ValueSize: entryHeader.ValueSize,
 				ValuePos:  uint64(valuePos),
@@ -308,8 +274,7 @@ func (s *store) loadEntriesFromFile(filePath string) error {
 				KeySize:   uint32(len(key)),
 			}
 		}
-
-		offset += int64(HEADER_SIZE + dataSize)
+		offset += uint64(len(entry))
 	}
 
 	return nil
@@ -361,9 +326,7 @@ func (s *Store) Put(key string, value []byte) error {
 		return err
 	}
 	s.KeyDir[string(keyByte)] = *record
-
 	s.currentSize += uint32(len(entry))
-
 	if s.currentSize >= MAXIMUM_FILE_SIZE {
 		if err := s.rotateFile(); err != nil {
 			return fmt.Errorf("Warning: File Rotation failed: %w", err)
@@ -473,7 +436,7 @@ func (s *Store) Merge() error {
 	groups := groupEntriesFFD(entries, MAXIMUM_MERGED_FILE_SIZE)
 
 	//TODO need rollback here
-	results, err := s.writeGroupsToFiles(groups)
+	results, err := s.saveGroups(groups)
 	if err != nil {
 		return fmt.Errorf("Error during writing groups to files:%w", err)
 	}
@@ -488,11 +451,12 @@ func (s *Store) Merge() error {
 
 // Cleans files that are not present in current KeyDir
 func (s *store) cleanJunk() error {
-	dataIds, err := s.getInactiveDataFileIds()
+	dataIds, err := inactiveFileIds(s.DirectoryName, OSFileSystem{}, s.currentFileId)
 	if err != nil {
 		return err
 	}
-	inUseDataIds := make([]int, 0, 0)
+
+	inUseDataIds := []int{s.currentFileId}
 	for entry := range maps.Values(s.KeyDir) {
 		if slices.Index(inUseDataIds, entry.FileId) == -1 {
 			inUseDataIds = append(inUseDataIds, entry.FileId)
@@ -529,53 +493,60 @@ type MergeResult struct {
 }
 
 // Writes groups to .data files. New fileIds gets incremented from currentFileId
-func (s *store) writeGroupsToFiles(groups [][]MergeEntryRecord) ([]MergeResult, error) {
+func (s *store) saveGroups(groups [][]MergeEntryRecord) ([]MergeResult, error) {
 	var length int
 	for _, v := range groups {
 		length += len(v)
 	}
 	result := make([]MergeResult, 0, length)
 	nextFileId := s.currentFileId + 1
-
 	for _, group := range groups {
-		destinationFileName := path.Join(s.DirectoryName, fmt.Sprintf("%d.data", nextFileId))
-		destinationFile, err := os.OpenFile(destinationFileName, os.O_CREATE|os.O_RDWR, 0644)
+		mergeResults, err := s.saveGroupToFile(group, nextFileId)
 		if err != nil {
-			destinationFile.Close()
 			return result, err
 		}
-		var currentOffset uint64
-		for _, staleEntry := range group {
-			originFile, err := os.Open(path.Join(s.DirectoryName, fmt.Sprintf("%d.data", staleEntry.Record.FileId)))
-			entry, err := readEntry(originFile, uint64(staleEntry.Record.ValuePos-HEADER_SIZE-uint64(len(staleEntry.Key))))
-			if err != nil {
-				return result, fmt.Errorf("Error while writing groups to file:%v", err)
-			}
-			n, err := destinationFile.WriteAt(entry, int64(currentOffset))
-			if err != nil {
-				return result, fmt.Errorf("Error while writing groups to file:%v", err)
-			}
-			if n != len(entry) {
-				return result, fmt.Errorf("Incomplete write op. Error while writing groups to file:%v", err)
-			}
-			result = append(result, MergeResult{
-				Key:      staleEntry.Key,
-				ValuePos: currentOffset + HEADER_SIZE + uint64(len(staleEntry.Key)),
-				FileId:   nextFileId,
-			})
-			currentOffset += uint64(len(entry))
-			if err := originFile.Close(); err != nil {
-				return result, fmt.Errorf("Error while closing origin file:%w", err)
-			}
+		result = append(result, mergeResults...)
+		nextFileId++
+	}
+	return result, nil
+}
 
+func (s *store) saveGroupToFile(group []MergeEntryRecord, fileId int) ([]MergeResult, error) {
+	destinationFileName := path.Join(s.DirectoryName, fmt.Sprintf("%d.data", fileId))
+	destinationFile, err := os.OpenFile(destinationFileName, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("opening destination file: %w", err)
+	}
+	defer destinationFile.Close()
+
+	result := make([]MergeResult, 0, len(group))
+	var currentOffset uint64
+	for _, staleEntry := range group {
+		originFile, err := os.Open(path.Join(s.DirectoryName, fmt.Sprintf("%d.data", staleEntry.Record.FileId)))
+		if err != nil {
+			return nil, fmt.Errorf("opening origin file: %w", err)
 		}
-		if err := destinationFile.Sync(); err != nil {
-			return result, fmt.Errorf("Error while syncing destination file:%w", err)
+		entry, entryHeader, err := readEntry(originFile, uint64(staleEntry.Record.ValuePos-HEADER_SIZE-uint64(len(staleEntry.Key))))
+		originFile.Close()
+		if err != nil {
+			return nil, fmt.Errorf("reading entry: %w", err)
 		}
-		if err := destinationFile.Close(); err != nil {
-			return result, fmt.Errorf("Error while closing destination file:%w", err)
+		n, err := destinationFile.WriteAt(entry, int64(currentOffset))
+		if err != nil {
+			return nil, fmt.Errorf("writing entry: %w", err)
 		}
-		nextFileId += 1
+		if n != len(entry) {
+			return nil, fmt.Errorf("incomplete write: wrote %d of %d bytes", n, len(entry))
+		}
+		result = append(result, MergeResult{
+			Key:      staleEntry.Key,
+			ValuePos: uint64(entryHeader.ValueOffset),
+			FileId:   fileId,
+		})
+		currentOffset += uint64(len(entry))
+	}
+	if err := destinationFile.Sync(); err != nil {
+		return nil, fmt.Errorf("syncing destination file: %w", err)
 	}
 	return result, nil
 }
@@ -627,70 +598,76 @@ func groupEntriesFFD(entries []MergeEntryRecord, maxSize int64) [][]MergeEntryRe
 	return groups
 }
 
-func readEntry(reader io.ReaderAt, offset uint64) ([]byte, error) {
+func readEntry(reader io.ReaderAt, offset uint64) ([]byte, *EntryHeader, error) {
 	headerBuf := make([]byte, HEADER_SIZE)
 	n, err := reader.ReadAt(headerBuf, int64(offset))
 	if err == io.EOF {
-		return nil, err
+		return nil, nil, err
 	}
 	if err != nil {
-		return nil, fmt.Errorf("Read: %d/%d bytes. Reading header at offset %d: %w", n, HEADER_SIZE, offset, err)
+		return nil, nil, fmt.Errorf("Read: %d/%d bytes. Reading header at offset %d: %w", n, HEADER_SIZE, offset, err)
 	}
 	entryHeader, err := ParseEntryHeader(headerBuf)
 	if err != nil {
-		return nil, fmt.Errorf("parsing header at offset %d: %w", offset, err)
+		return nil, nil, fmt.Errorf("parsing header at offset %d: %w", offset, err)
 	}
 	dataSize := uint64(entryHeader.KeySize + entryHeader.ValueSize)
 	dataBuf := make([]byte, dataSize)
 	n, err = reader.ReadAt(dataBuf, int64(offset)+HEADER_SIZE)
 	if err == io.EOF {
-		return nil, err
+		return nil, nil, err
 	}
 	if err != nil {
-		return nil, fmt.Errorf("Read: %d/%d bytes. Reading entry data at offset %d: %w", n, HEADER_SIZE, offset, err)
+		return nil, nil, fmt.Errorf("Read: %d/%d bytes. Reading entry data at offset %d: %w", n, HEADER_SIZE, offset, err)
 	}
 	fullEntry := make([]byte, HEADER_SIZE+dataSize)
 	copy(fullEntry, headerBuf)
 	copy(fullEntry[HEADER_SIZE:], dataBuf)
 
 	if err := VerifyEntryCRC(fullEntry); err != nil {
-		return nil, fmt.Errorf("Warning: CRC mismatch at offset %d", offset)
+		return nil, nil, fmt.Errorf("Warning: CRC mismatch at offset %d", offset)
 	}
-	isTomb, err := isTombStoneEntry(fullEntry)
-	if err != nil {
-		fmt.Printf("Error while checking if entry is tombstone entry: %v", err)
-	}
-	if isTomb {
-		return nil, fmt.Errorf("Entry is tomb entry!")
-	}
-	return fullEntry, nil
+	//isTomb, err := isTombStoneEntry(fullEntry)
+	// if err != nil {
+	// 	fmt.Printf("Error while checking if entry is tombstone entry: %v", err)
+	// }
+	// if isTomb {
+	// 	return nil, nil, fmt.Errorf("Entry is tomb entry!")
+	// }
+	return fullEntry, entryHeader, nil
 }
 
-// Returns files with *.data pattern in store directory. Ignores current active file.
-func (s *store) getInactiveDataFileIds() ([]int, error) {
-	dirEntries, err := s.fileSystem.ReadDir(s.DirectoryName)
+func fileIds(directory string, fs FileSystem) ([]int, error) {
+	dirEntries, err := fs.ReadDir(directory)
 	if err != nil {
-		return nil, fmt.Errorf("reading store directory: %w", err)
+		return nil, err
 	}
-
-	dataFiles := make([]string, 0, len(dirEntries))
-	for _, dirEntry := range dirEntries {
-		if !dirEntry.IsDir() && strings.HasSuffix(dirEntry.Name(), ".data") {
-			if fmt.Sprintf("%d.data", s.currentFileId) != dirEntry.Name() { //TODO optimize check
-				dataFiles = append(dataFiles, dirEntry.Name())
-			}
+	ids := make([]int, 0)
+	for _, entry := range dirEntries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".data") {
+			continue
 		}
-	}
-	dataFilesInts := make([]int, 0, len(dataFiles))
-	for _, dataFile := range dataFiles {
-		a, err := extractFileId(dataFile)
+		id, err := extractFileId(entry.Name())
 		if err != nil {
 			return nil, err
 		}
-		dataFilesInts = append(dataFilesInts, a)
+		ids = append(ids, id)
 	}
+	return ids, nil
+}
 
-	return dataFilesInts, nil
+func inactiveFileIds(directory string, fs FileSystem, currentFileId int) ([]int, error) {
+	ids, err := fileIds(directory, fs)
+	if err != nil {
+		return nil, err
+	}
+	inactive := make([]int, 0, len(ids))
+	for _, id := range ids {
+		if id != currentFileId {
+			inactive = append(inactive, id)
+		}
+	}
+	return inactive, nil
 }
 
 func (s *Store) rotateFile() error {
@@ -770,33 +747,6 @@ func (s *store) Close() error {
 	return nil
 }
 
-func (of OSFileSystem) getNewFileId(directory string) (int, error) {
-	entries, err := os.ReadDir(directory)
-	if err != nil {
-		return 0, fmt.Errorf("reading the directory: %w", err)
-	}
-	var maxId int = 0
-	foundAny := false
-	for _, entry := range entries {
-		fi, err := entry.Info()
-		if err != nil {
-			return 0, fmt.Errorf("reading the file: %w", err)
-		}
-		if s, f := strings.CutSuffix(fi.Name(), ".data"); f {
-			if id, err := strconv.Atoi(s); err == nil {
-				foundAny = true
-				if id > maxId {
-					maxId = id
-				}
-			}
-		}
-	}
-	if foundAny {
-		return maxId + 1, nil
-	}
-	return maxId, nil
-}
-
 func createNewDataFile(newFileId int, directory string, fileSystem FileSystem) (*os.File, error) {
 	newFilePath := filepath.Join(directory, fmt.Sprintf("%d.data", newFileId))
 	f, err := fileSystem.Create(newFilePath)
@@ -819,9 +769,19 @@ func Open(directory string, fileSystem FileSystem, syncOnPut bool) (*Store, erro
 		return nil, fmt.Errorf("failed to acquire exclusive lock: %w", err)
 	}
 
-	newFileId, err := fileSystem.getNewFileId(directory)
+	dataFileIds, err := fileIds(directory, fileSystem)
 	if err != nil {
-		return nil, fmt.Errorf("getting a new file Id for store: %w", err)
+		return nil, fmt.Errorf("Error while getting dataFileIds in dir:%s :%w", directory, err)
+	}
+
+	keyDir, err := generateKeyDirFromFileIds(directory, dataFileIds)
+	if err != nil {
+		return nil, fmt.Errorf("Error while getting keyDir in dir:%s :%w", directory, err)
+	}
+
+	var newFileId int
+	if len(dataFileIds) != 0 {
+		newFileId = slices.Max(dataFileIds) + 1
 	}
 
 	newFile, err := createNewDataFile(newFileId, directory, fileSystem)
@@ -832,7 +792,7 @@ func Open(directory string, fileSystem FileSystem, syncOnPut bool) (*Store, erro
 	store := &Store{
 		store: &store{
 			DirectoryName: directory,
-			KeyDir:        make(map[string]EntryRecord),
+			KeyDir:        keyDir,
 			lockFile:      lockFile,
 			currentFileId: newFileId,
 			fileSystem:    fileSystem,
@@ -840,7 +800,7 @@ func Open(directory string, fileSystem FileSystem, syncOnPut bool) (*Store, erro
 		},
 		syncOnPut: syncOnPut}
 
-	return store, store.updateKeyDir()
+	return store, nil
 }
 
 func OpenReadOnly(directory string, fileSystem FileSystem) (*ReadOnlyStore, error) {
@@ -852,21 +812,30 @@ func OpenReadOnly(directory string, fileSystem FileSystem) (*ReadOnlyStore, erro
 		return nil, fmt.Errorf("failed to acquire shared lock: %w", err)
 	}
 
-	newFileId, err := fileSystem.getNewFileId(directory)
+	dataFileIds, err := fileIds(directory, fileSystem)
 	if err != nil {
-		return nil, fmt.Errorf("getting a new file Id for store: %w", err)
+		return nil, fmt.Errorf("Error while getting dataFileIds in dir:%s :%w", directory, err)
+	}
+
+	keyDir, err := generateKeyDirFromFileIds(directory, dataFileIds)
+	if err != nil {
+		return nil, fmt.Errorf("Error while getting keyDir in dir:%s :%w", directory, err)
+	}
+	var newFileId int
+	if len(dataFileIds) != 0 {
+		newFileId = slices.Max(dataFileIds) + 1
 	}
 
 	store := &ReadOnlyStore{
 		store: &store{
 			DirectoryName: directory,
-			KeyDir:        make(map[string]EntryRecord),
+			KeyDir:        keyDir,
 			lockFile:      lockFile,
 			currentFileId: newFileId,
 			fileSystem:    fileSystem,
 		}}
 
-	return store, store.updateKeyDir()
+	return store, nil
 }
 
 func validateReadPermission(directory string, fileSystem FileSystem) error {

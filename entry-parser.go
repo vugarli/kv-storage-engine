@@ -35,7 +35,7 @@ func ParseEntryHeader(data []byte) (*EntryHeader, error) {
 	}, nil
 }
 
-func ExtractKey(data []byte) ([]byte, error) {
+func ExtractKeyGivenData(data []byte) ([]byte, error) {
 	header, err := ParseEntryHeader(data)
 	if err != nil {
 		return nil, err
@@ -45,6 +45,12 @@ func ExtractKey(data []byte) ([]byte, error) {
 		return nil, fmt.Errorf("entry truncated at key")
 	}
 
+	return data[header.KeyOffset : header.KeyOffset+int(header.KeySize)], nil
+}
+func ExtractKeyGivenHeader(data []byte, header EntryHeader) ([]byte, error) {
+	if len(data) < header.KeyOffset+int(header.KeySize) {
+		return nil, fmt.Errorf("entry truncated at key")
+	}
 	return data[header.KeyOffset : header.KeyOffset+int(header.KeySize)], nil
 }
 
