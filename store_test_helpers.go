@@ -74,7 +74,7 @@ func writeTestEntryWithTimeStamp(t *testing.T, store *Store, key string, value [
 
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	record, err := store.writeEntry(entry, key, value, timestamp)
+	record, err := store.writeEntry(entry, key, timestamp)
 	store.currentSize += uint32(len(entry))
 
 	if err != nil {

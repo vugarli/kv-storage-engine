@@ -125,7 +125,7 @@ type ReadOnlyStore struct {
 	*store
 }
 
-func (s *Store) writeEntry(entry []byte, key string, value []byte, timestamp uint64) (*EntryRecord, error) {
+func (s *Store) writeEntry(entry []byte, key string, timestamp uint64) (*EntryRecord, error) {
 	if key == "" {
 		return nil, fmt.Errorf("Key can't be empty string")
 	}
@@ -160,7 +160,7 @@ func (s *Store) writeEntry(entry []byte, key string, value []byte, timestamp uin
 
 	entryRecord := EntryRecord{
 		FileId:    s.currentFileId,
-		ValueSize: uint32(len(value)),
+		ValueSize: uint32(len(entry[HEADER_SIZE+len(key):])),
 		ValuePos:  uint64(valuePosition),
 		Timestamp: timestamp,
 		KeySize:   uint32(len(key)),
@@ -192,7 +192,10 @@ func extractFileId(a string) (int, error) {
 
 	if start != -1 {
 		digit := a[start:end]
-		num, _ := strconv.Atoi(digit)
+		num, err := strconv.Atoi(digit)
+		if err != nil {
+			return 0, fmt.Errorf("data file format is wrong: %w", err)
+		}
 		return num, nil
 	}
 	return 0, fmt.Errorf("data file format is wrong")
@@ -206,8 +209,8 @@ func generateKeyDirFromFileIds(directory string, inactiveDataFileIds []int) (map
 		dataFileName := fmt.Sprintf("%d.data", dataFileId)
 		filepath := filepath.Join(directory, dataFileName)
 
-		if err := populateKeyDirWEntriesFromFile(filepath, keyDir); err != nil {
-			fmt.Printf("Warning: error loading %s: %v", dataFileName, err)
+		if err := loadKeyDirFromFile(filepath, keyDir); err != nil {
+			return nil, fmt.Errorf("Warning: error loading %s: %v", dataFileName, err)
 		}
 	}
 	return keyDir, nil
@@ -223,7 +226,7 @@ func isTombStoneEntry(header []byte) (bool, error) {
 	return timeStamp>>63 == 1 && parsedHeader.ValueSize == 0, nil
 }
 
-func populateKeyDirWEntriesFromFile(filePath string, keyDir map[string]EntryRecord) error {
+func loadKeyDirFromFile(filePath string, keyDir map[string]EntryRecord) error {
 	filename := filepath.Base(filePath)
 	fileId, err := extractFileId(filename)
 	if err != nil {
@@ -321,7 +324,7 @@ func (s *Store) Put(key string, value []byte) error {
 	keyByte := []byte(key)
 	timeStamp := uint64(time.Now().Unix())
 	entry := InitEntry(keyByte, []byte(value), timeStamp)
-	record, err := s.writeEntry(entry, key, value, timeStamp)
+	record, err := s.writeEntry(entry, key, timeStamp)
 	if err != nil {
 		return err
 	}
@@ -411,7 +414,7 @@ func (s *Store) Delete(key string) error {
 	timeStamp := uint64(time.Now().Unix())
 	tombStoneEntry := InitTombstoneEntry(key, timeStamp)
 
-	if _, err := s.writeEntry(tombStoneEntry, key, []byte{}, timeStamp); err != nil {
+	if _, err := s.writeEntry(tombStoneEntry, key, timeStamp); err != nil {
 		return err
 	}
 	delete(s.KeyDir, key)
@@ -423,6 +426,7 @@ func (s *Store) Merge() error {
 	var entries []MergeEntryRecord
 
 	s.mu.Lock()
+	defer s.mu.Unlock()
 
 	for key, record := range maps.All(s.KeyDir) {
 		if record.FileId != s.currentFileId {
@@ -441,7 +445,6 @@ func (s *Store) Merge() error {
 		return fmt.Errorf("Error during writing groups to files:%w", err)
 	}
 	s.updateKeydirFromMergeResults(results)
-	s.mu.Unlock()
 
 	if err := s.cleanJunk(); err != nil {
 		return fmt.Errorf("Error while cleaning junk data file names:%w", err)
@@ -451,21 +454,22 @@ func (s *Store) Merge() error {
 
 // Cleans files that are not present in current KeyDir
 func (s *store) cleanJunk() error {
-	dataIds, err := inactiveFileIds(s.DirectoryName, OSFileSystem{}, s.currentFileId)
+	dataIds, err := inactiveFileIds(s.DirectoryName, s.fileSystem, s.currentFileId)
 	if err != nil {
 		return err
 	}
 
-	inUseDataIds := []int{s.currentFileId}
+	inUseDataIds := make(map[int]struct{})
+	inUseDataIds[s.currentFileId] = struct{}{}
 	for entry := range maps.Values(s.KeyDir) {
-		if slices.Index(inUseDataIds, entry.FileId) == -1 {
-			inUseDataIds = append(inUseDataIds, entry.FileId)
-		}
+		inUseDataIds[entry.FileId] = struct{}{}
 	}
+
 	for _, dataId := range dataIds {
-		if slices.Index(inUseDataIds, dataId) == -1 {
+		_, exists := inUseDataIds[dataId]
+		if !exists {
 			fileName := path.Join(s.DirectoryName, fmt.Sprintf("%d.data", dataId))
-			os.Remove(fileName)
+			s.fileSystem.Remove(fileName)
 		}
 	}
 	return nil
@@ -477,8 +481,8 @@ func (s *store) updateKeydirFromMergeResults(results []MergeResult) {
 		if e {
 			entry.FileId = result.FileId
 			entry.ValuePos = result.ValuePos
+			s.KeyDir[result.Key] = entry
 		}
-		s.KeyDir[result.Key] = entry
 	}
 }
 
@@ -673,7 +677,10 @@ func inactiveFileIds(directory string, fs FileSystem, currentFileId int) ([]int,
 func (s *Store) rotateFile() error {
 
 	if s.currentFile != nil {
-		s.currentFile.Sync()
+		if err := s.currentFile.Sync(); err != nil {
+			return fmt.Errorf("failed to rotate current file. Sync error:%w", err)
+		}
+
 		s.currentFile.Close()
 	}
 
@@ -894,7 +901,7 @@ func InitEntry(key, value []byte, timeStamp uint64) []byte {
 	return buf
 }
 
-// tombstone entry is regular entry with timestamp's least significant bit set to 1
+// tombstone entry is regular entry with timestamp's most significant bit set to 1
 func InitTombstoneEntry(key string, timeStamp uint64) []byte {
 	// CRC ModifiedTimeStamp KSZ VSZ(0) K V(nil)
 	totalSize := CRC_SIZE + TSTAMP_SIZE + KEY_SIZE_SIZE + VALUE_SIZE_SIZE + len(key) + 0
