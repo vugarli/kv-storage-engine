@@ -126,7 +126,7 @@ func TestOpen(t *testing.T) {
 
 			tt.setupMock(mockFS)
 
-			store, err := Open(tt.path, tt.syncOnPut)
+			store, err := OpenTest(tt.path, tt.syncOnPut)
 
 			if tt.expectedError != nil {
 				if err == nil {
@@ -222,7 +222,7 @@ func TestOpenReadOnly(t *testing.T) {
 
 			tt.setupMock(mockFS)
 
-			store, err := OpenReadOnly(tt.path)
+			store, err := OpenReadOnlyTest(tt.path)
 
 			if tt.expectedError != nil {
 				if err == nil {
@@ -403,11 +403,9 @@ func TestEntryParsing(t *testing.T) {
 
 func TestWriteEntry_EdgeCases(t *testing.T) {
 	t.Run("nil currentFile", func(t *testing.T) {
-		store := &Store{
-			store: &store{
-				currentFile: nil,
-				KeyDir:      make(map[string]EntryRecord),
-			},
+		store := &store{
+			currentFile: nil,
+			KeyDir:      make(map[string]EntryRecord),
 		}
 
 		err := store.Put("key", []byte("value"))
@@ -630,7 +628,7 @@ func TestListKeys(t *testing.T) {
 		fileSystem = tempFs
 	}()
 
-	store, _ := Open(".", false)
+	store, _ := OpenTest(".", false)
 	entries := []struct {
 		key string
 	}{

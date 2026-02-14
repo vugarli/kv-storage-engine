@@ -82,7 +82,9 @@ func TestPut(t *testing.T) {
 	})
 	t.Run("multiple writes to same key", func(t *testing.T) {
 		tempDir := t.TempDir()
-		store, _ := Open(tempDir, false)
+		stores, _ := Open(tempDir, false)
+		store := Unwrap(stores)
+
 		defer store.Close()
 
 		key := "key"
@@ -103,7 +105,8 @@ func TestPut(t *testing.T) {
 
 	t.Run("concurrent writes are serialized", func(t *testing.T) {
 		tempDir := t.TempDir()
-		store, _ := Open(tempDir, false)
+		stores, _ := Open(tempDir, false)
+		store := Unwrap(stores)
 		defer store.Close()
 
 		var wg sync.WaitGroup
@@ -178,7 +181,8 @@ func TestFileRotation(t *testing.T) {
 
 func TestWriteEntry_ValuePosition(t *testing.T) {
 	tempDir := t.TempDir()
-	store, _ := Open(tempDir, false)
+	stores, _ := Open(tempDir, false)
+	store := Unwrap(stores)
 	defer store.Close()
 
 	tests := []struct {

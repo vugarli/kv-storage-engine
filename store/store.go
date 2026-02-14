@@ -101,18 +101,24 @@ type store struct {
 	mu            sync.RWMutex
 	currentFile   FileLike
 	currentSize   uint32
+	syncOnPut     bool
+	fileSystem    FileSystem
 }
 
-type Store struct {
-	*store
-	syncOnPut bool
+type RWStore interface {
+	RStore
+	Put(key string, value []byte) error
+	Sync() error
+	Delete(key string) error
+	Merge() error
+}
+type RStore interface {
+	Get(key string) ([]byte, error)
+	ListKeys() []string
+	Close() error
 }
 
-type ReadOnlyStore struct {
-	*store
-}
-
-func Open(directory string, syncOnPut bool) (*Store, error) {
+func Open(directory string, syncOnPut bool) (RWStore, error) {
 	if err := validateReadPermission(directory); err != nil {
 		return nil, err
 	}
@@ -135,29 +141,33 @@ func Open(directory string, syncOnPut bool) (*Store, error) {
 		return nil, fmt.Errorf("Error while getting keyDir in dir:%s :%w", directory, err)
 	}
 
-	var newFileId int
-	if len(dataFileIds) != 0 {
-		newFileId = slices.Max(dataFileIds) + 1
-	}
+	newFileId := getNewFileId(dataFileIds)
 
 	newFile, err := createNewDataFile(newFileId, directory)
 	if err != nil {
 		return nil, fmt.Errorf("Failed creating initial data file: %w", err)
 	}
 
-	store := &Store{
-		store: &store{
-			DirectoryName: directory,
-			KeyDir:        keyDir,
-			lockFile:      lockFile,
-			currentFileId: newFileId,
-			currentFile:   newFile,
-		},
-		syncOnPut: syncOnPut}
+	store := &store{
+		DirectoryName: directory,
+		KeyDir:        keyDir,
+		lockFile:      lockFile,
+		currentFileId: newFileId,
+		currentFile:   newFile,
+		syncOnPut:     syncOnPut}
 
 	return store, nil
 }
-func OpenReadOnly(directory string) (*ReadOnlyStore, error) {
+
+func getNewFileId(dataFileIds []int) int {
+	var newFileId int
+	if len(dataFileIds) != 0 {
+		newFileId = slices.Max(dataFileIds) + 1
+	}
+	return newFileId
+}
+
+func OpenReadOnly(directory string) (RStore, error) {
 	if err := validateReadPermission(directory); err != nil {
 		return nil, err
 	}
@@ -175,19 +185,15 @@ func OpenReadOnly(directory string) (*ReadOnlyStore, error) {
 	if err != nil {
 		return nil, fmt.Errorf("Error while getting keyDir in dir:%s :%w", directory, err)
 	}
-	var newFileId int
-	if len(dataFileIds) != 0 {
-		newFileId = slices.Max(dataFileIds) + 1
+
+	newFileId := getNewFileId(dataFileIds)
+
+	store := &store{
+		DirectoryName: directory,
+		KeyDir:        keyDir,
+		lockFile:      lockFile,
+		currentFileId: newFileId,
 	}
-
-	store := &ReadOnlyStore{
-		store: &store{
-			DirectoryName: directory,
-			KeyDir:        keyDir,
-			lockFile:      lockFile,
-			currentFileId: newFileId,
-		}}
-
 	return store, nil
 }
 
@@ -204,7 +210,7 @@ func (s *store) Close() error {
 	return nil
 }
 
-func (s *Store) Put(key string, value []byte) error {
+func (s *store) Put(key string, value []byte) error {
 
 	if err := validatePut(key, value); err != nil {
 		return err
@@ -271,7 +277,7 @@ func (s *store) ListKeys() []string {
 	defer s.mu.RUnlock()
 	return slices.Collect(maps.Keys(s.KeyDir))
 }
-func (s *Store) Sync() error {
+func (s *store) Sync() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.currentFile == nil {
@@ -282,7 +288,7 @@ func (s *Store) Sync() error {
 	}
 	return nil
 }
-func (s *Store) Delete(key string) error {
+func (s *store) Delete(key string) error {
 	if key == "" {
 		return ErrKeyNotFound
 	}
@@ -305,7 +311,7 @@ func (s *Store) Delete(key string) error {
 
 	return nil
 }
-func (s *Store) Merge() error {
+func (s *store) Merge() error {
 	var entries []MergeEntryRecord
 
 	s.mu.Lock()
@@ -399,7 +405,7 @@ func readEntry(reader io.ReaderAt, offset uint64) ([]byte, *EntryHeader, error) 
 	}
 	return fullEntry, entryHeader, nil
 }
-func (s *Store) writeEntry(entry []byte, key string, timestamp uint64) (*EntryRecord, error) {
+func (s *store) writeEntry(entry []byte, key string, timestamp uint64) (*EntryRecord, error) {
 	if key == "" {
 		return nil, fmt.Errorf("Key can't be empty string")
 	}
@@ -722,7 +728,7 @@ func inactiveFileIds(directory string, currentFileId int) ([]int, error) {
 	return inactive, nil
 }
 
-func (s *Store) rotateFile() error {
+func (s *store) rotateFile() error {
 
 	if s.currentFile != nil {
 		if err := s.currentFile.Sync(); err != nil {
