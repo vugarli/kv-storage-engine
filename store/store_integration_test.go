@@ -428,6 +428,7 @@ func TestMerge(t *testing.T) {
 		// remaining files: 2.data, 1.data
 		// 2.data
 		// 3.data 1 key3 + 1 key4 + 3 entries
+
 		store.Close()
 
 		dirEntries, _ := filepath.Glob(path.Join(directory, "*.data"))
@@ -451,6 +452,7 @@ func TestMerge(t *testing.T) {
 		//assertEntryExistsKeyValue(t, store, "key3", strings.Repeat("\x00", size))
 		assertKeyInKeyDir(t, store.store, "key3")
 		assertKeyInKeyDir(t, store.store, "key4")
+
 	})
 
 }
