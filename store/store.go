@@ -154,8 +154,8 @@ func Open(directory string, syncOnPut bool, options ...option) (*RWStore, error)
 	seq := idSequence(newFileId)
 	next, _ := iter.Pull(seq)
 	s.nextId = next
-	// handle error gracefully
-	s.currentFileId, _ = s.acquireId()
+
+	s.currentFileId = s.acquireNextId()
 
 	newFile, err := createNewDataFile(newFileId, directory, s.fileSystem)
 	if err != nil {
@@ -165,17 +165,16 @@ func Open(directory string, syncOnPut bool, options ...option) (*RWStore, error)
 
 	store := &RWStore{store: s}
 
-	//store.ScheduleMerge(PeriodicMerge(10 * time.Second))
-
 	return store, nil
 }
 
-func (s *store) acquireId() (int, error) {
+// Gets next unique incremental Id from iterator.
+func (s *store) acquireNextId() int {
 	id, ok := s.nextId()
 	if !ok {
-		return 0, fmt.Errorf("file id sequence exhausted")
+		panic("file id sequence exhausted")
 	}
-	return id, nil
+	return id
 }
 
 func getMaxFileId(dataFileIds []int) int {
@@ -333,6 +332,7 @@ func (s *RWStore) Delete(key string) error {
 	return nil
 }
 
+// TODO
 func (s *RWStore) Merge(retStrat MergeCandidateRetrievalStrat) error {
 	// Holding RLock as candidate retrieval may access KeyDir
 	s.mu.RLock()
@@ -349,7 +349,8 @@ func (s *RWStore) Merge(retStrat MergeCandidateRetrievalStrat) error {
 	defer s.mu.Unlock()
 
 	// id sequence starts after currentFileId
-	results, err := s.saveGroups(groups, SaveToDiskStrat(s.DirectoryName, s.nextId))
+	results, err := s.saveGroups(groups, SaveToDisk(s.DirectoryName, s.nextId),
+		CleanCorruptedFromDisk(s.DirectoryName, s.fileSystem), CommitToDisk(s.DirectoryName, s.fileSystem))
 	if err != nil {
 		return fmt.Errorf("Error during writing groups to files:%w", err)
 	}
@@ -688,15 +689,7 @@ func (s *RWStore) updateKeydirFromMergeResults(results []MergeResult) {
 	}
 }
 
-func (s *store) cleanCorruptedMergeFiles(corruptedResults []MergeResult) {
-	for _, result := range corruptedResults {
-		filePath := filepath.Join(s.DirectoryName, fmt.Sprintf("%d.data", result.FileId))
-		if err := s.fileSystem.Remove(filePath); err != nil {
-			//log
-		}
-	}
-}
-
+// Next invocation returns startId, and furhter invocations returns incrementally
 func idSequence(startId int) iter.Seq[int] {
 	return func(yield func(int) bool) {
 		for id := startId; ; id++ {
@@ -707,81 +700,31 @@ func idSequence(startId int) iter.Seq[int] {
 	}
 }
 
-type GroupSavingStrat func(group []MergeEntryRecord) ([]MergeResult, error)
-
-func SaveToDiskStrat(directory string, idFetcher func() (int, bool)) GroupSavingStrat {
-
-	return func(group []MergeEntryRecord) ([]MergeResult, error) {
-		fileId, ok := idFetcher()
-		if !ok {
-			return nil, fmt.Errorf("id sequence exhausted")
-		}
-
-		destinationFileName := filepath.Join(directory, fmt.Sprintf("%d.data", fileId))
-		destinationFile, err := os.OpenFile(destinationFileName, os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
-			return nil, fmt.Errorf("opening destination file: %w", err)
-		}
-		defer destinationFile.Close()
-
-		result := make([]MergeResult, 0, len(group))
-		var currentOffset uint64
-		for _, staleEntry := range group {
-			originFile, err := os.Open(filepath.Join(directory, fmt.Sprintf("%d.data", staleEntry.Record.FileId)))
-			if err != nil {
-				return nil, fmt.Errorf("%w Opening origin file: %w", ErrCorruptedState, err)
-			}
-			entry, entryHeader, err := readEntry(originFile, uint64(staleEntry.Record.ValuePos-HEADER_SIZE-uint64(len(staleEntry.Key))))
-			originFile.Close()
-			if err != nil {
-				return result, fmt.Errorf("%w Reading entry: %w", ErrCorruptedState, err)
-			}
-			n, err := destinationFile.WriteAt(entry, int64(currentOffset))
-			if err != nil {
-				return result, fmt.Errorf("%w Writing entry: %w", ErrCorruptedState, err)
-			}
-			if n != len(entry) {
-				return result, fmt.Errorf("%w Incomplete write: wrote %d of %d bytes", ErrCorruptedState, n, len(entry))
-			}
-			newValuePos := currentOffset + HEADER_SIZE + uint64(entryHeader.KeySize)
-			result = append(result, MergeResult{
-				Key:      staleEntry.Key,
-				ValuePos: newValuePos,
-				FileId:   fileId,
-			})
-			currentOffset += uint64(len(entry))
-		}
-		if err := destinationFile.Sync(); err != nil {
-			return nil, fmt.Errorf("syncing destination file: %w", err)
-		}
-		return result, nil
-	}
-}
-
-// BUG: group file Id wrongly calculated
-// Writes groups to .data files. New fileIds gets incremented from currentFileId
-func (s *RWStore) saveGroups(groups [][]MergeEntryRecord, savingStrat GroupSavingStrat) ([]MergeResult, error) {
+// Persists, and handles corrupted groups according to strats
+func (s *RWStore) saveGroups(groups [][]MergeEntryRecord,
+	savingStrat GroupSavingStrat, onCorruption GroupCorruptionStrat, onSuccess GroupCommitStrat) ([]MergeResult, error) {
 	var length int
 	for _, v := range groups {
 		length += len(v)
 	}
-	result := make([]MergeResult, 0, length)
+	results := make([]MergeResult, 0, length)
 	nextFileId := s.currentFileId + 1
 	for _, group := range groups {
 		mergeResults, err := savingStrat(group)
-		// Need to clean corrupted files
 		if err == ErrCorruptedState {
-			s.cleanCorruptedMergeFiles(mergeResults)
+			onCorruption(mergeResults)
 		}
 		if err != nil {
-			return result, err
+			return results, err
 		}
 		//TODO save group to hint
-
-		result = append(result, mergeResults...)
+		results = append(results, mergeResults...)
 		nextFileId++
 	}
-	return result, nil
+	// commit results
+	onSuccess(results)
+
+	return results, nil
 }
 
 func fileIds(directory string, fileSystem FileSystem) ([]int, error) {
@@ -816,6 +759,7 @@ func inactiveFileIds(directory string, currentFileId int, fileSystem FileSystem)
 	return inactive, nil
 }
 
+// Needs caller to hold Lock as it mutates store state
 func (s *RWStore) rotateFile() error {
 
 	if s.currentFile != nil {
@@ -824,9 +768,10 @@ func (s *RWStore) rotateFile() error {
 		}
 		s.currentFile.Close()
 	}
+	//TODO refactor. new file gen + currentId and size needs to be isolated
 
-	//TODO handle gracefully
-	s.currentFileId, _ = s.acquireId()
+	// Acquire new Id, and reset store size to 0
+	s.currentFileId = s.acquireNextId()
 	s.currentSize = 0
 
 	newFile, err := createNewDataFile(s.currentFileId, s.DirectoryName, s.fileSystem)
