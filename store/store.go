@@ -225,7 +225,7 @@ func OpenReadOnly(directory string, options ...option) (*ROStore, error) {
 
 func (s *store) Close() error {
 	if s.lockFile != nil {
-		Unlock(s.lockFile)
+		s.fileSystem.unlockAcquiredLock(s.DirectoryName)
 		s.lockFile.Close()
 	}
 	if s.currentFile != nil {
