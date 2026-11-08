@@ -15,7 +15,7 @@ type FileSystem interface {
 	ReadDir(name string) ([]fs.DirEntry, error)
 	acquireExclusiveLock(directory string) (*os.File, error)
 	acquireSharedLock(directory string) (*os.File, error)
-	unlockAcquiredLock(directory string) error
+	unlockAcquiredLock(lockFile *os.File) error
 	OpenFile(name string, flag int, perm os.FileMode) (*os.File, error)
 	Rename(oldpath string, newpath string) error
 	Stat(name string) (os.FileInfo, error)
@@ -23,13 +23,7 @@ type FileSystem interface {
 
 type OSFileSystem struct{}
 
-func (fs OSFileSystem) unlockAcquiredLock(directory string) error {
-	filePath := filepath.Join(directory, ".lock")
-
-	lockFile, err := os.OpenFile(filePath, os.O_RDONLY, 0644)
-	if err != nil {
-		return fmt.Errorf("cannot open lock file: %w", err)
-	}
+func (fs OSFileSystem) unlockAcquiredLock(lockFile *os.File) error {
 	return Unlock(lockFile)
 }
 

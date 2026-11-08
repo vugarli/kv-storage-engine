@@ -45,7 +45,7 @@ type MockFileSystem struct {
 	ReadDirFunc              func(name string) ([]fs.DirEntry, error)
 	acquireExclusiveLockFunc func(directory string) (*os.File, error)
 	acquireSharedLockFunc    func(directory string) (*os.File, error)
-	unlockAcquiredLockFunc   func(direcotry string) error
+	unlockAcquiredLockFunc   func(lockFile *os.File) error
 	getNewFileIdFunc         func(directory string) (int, error)
 	renames                  map[string]string
 	renameErr                error
@@ -59,9 +59,9 @@ func (m MockFileSystem) getNewFileId(directory string) (int, error) {
 
 }
 
-func (m MockFileSystem) unlockAcquiredLock(directory string) error {
+func (m MockFileSystem) unlockAcquiredLock(lockFile *os.File) error {
 	if m.unlockAcquiredLockFunc != nil {
-		return m.unlockAcquiredLockFunc(directory)
+		return m.unlockAcquiredLockFunc(lockFile)
 	}
 	return nil
 }
